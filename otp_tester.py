@@ -32,11 +32,11 @@ from telegram.ext import (
 
 # ---- config -------------------------------------------------------------
 
-API_ID = 34973549
+API_ID = 38345145
 
-API_HASH = "3b4e68116efb4d93435aa2c151cd66b7"
+API_HASH = "df76d621b0eb158ba8dc705680e4b81e"
 
-BOT_TOKEN = "PUT_YOUR_BOTFATHER_TOKEN_HERE"
+BOT_TOKEN = "9008351820:AAGMHdKt0qtT244FKvrBrvUSKxn_p38pwag"
 
 # your own session strings — one per worker, generated once per number
 
