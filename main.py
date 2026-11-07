@@ -12,7 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -45,17 +45,17 @@ OWNER_IDS = {
     if x.strip().isdigit()
 }
 
-# Force-join targets (username with @ or numeric id as string)
-FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "").strip()  # e.g. @mychannel or -100123...
-FORCE_GROUP = os.getenv("FORCE_GROUP", "").strip()      # e.g. @mygroup   or -100456...
+# Force-join targets (@username or full https://t.me/... link)
+FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "").strip()
+FORCE_GROUP = os.getenv("FORCE_GROUP", "").strip()
 
 if not BOT_TOKEN or not API_ID or not API_HASH:
     raise SystemExit("Missing BOT_TOKEN / API_ID / API_HASH in environment or .env")
 if not OWNER_IDS:
     raise SystemExit("Missing OWNER_IDS in environment or .env (at least one owner required)")
 
-MIN_LIMIT_HOURS = 7          # permanent stop threshold
-SEND_INTERVAL = 2            # seconds between OTP requests
+MIN_LIMIT_HOURS = 7
+SEND_INTERVAL = 2
 DATA_FILE = Path("bot_data.json")
 
 # ─── STATE ────────────────────────────────────────────────────────────────────
@@ -85,7 +85,6 @@ def save_data(data: dict) -> None:
 
 
 def get_access() -> dict[str, float]:
-    """user_id (str) → expiry unix timestamp"""
     return load_data().get("access", {})
 
 
@@ -126,7 +125,6 @@ def has_access(user_id: int) -> bool:
     if is_owner(user_id):
         return True
     if is_open_mode():
-        # open mode still requires force-join check (done separately)
         return True
     access = get_access()
     key = str(user_id)
@@ -151,14 +149,26 @@ def days_left(user_id: int) -> float:
 # ─── FORCE JOIN ───────────────────────────────────────────────────────────────
 async def is_member(bot, chat_id_or_username: str, user_id: int) -> bool:
     if not chat_id_or_username:
-        return True  # not configured → skip check
+        return True
     try:
-        member = await bot.get_chat_member(chat_id_or_username, user_id)
+        # For membership check we need the chat identifier Telegram understands
+        # (@username or numeric id). If user put a full invite link, strip it.
+        target = chat_id_or_username
+        if "t.me/" in target:
+            # extract username or +invite part is not usable for get_chat_member
+            # so we keep only @username form when possible
+            part = target.split("t.me/")[-1].split("?")[0]
+            if part.startswith("+"):
+                # private invite link – cannot check membership reliably this way
+                return True  # skip hard check, still show button
+            target = "@" + part if not part.startswith("@") else part
+
+        member = await bot.get_chat_member(target, user_id)
         return member.status in (
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER,
-            ChatMemberStatus.RESTRICTED,  # still in chat
+            ChatMemberStatus.RESTRICTED,
         )
     except (BadRequest, Forbidden) as e:
         log.warning("Membership check failed for %s / %s: %s", chat_id_or_username, user_id, e)
@@ -168,32 +178,51 @@ async def is_member(bot, chat_id_or_username: str, user_id: int) -> bool:
         return False
 
 
-async def check_force_join(bot, user_id: int) -> tuple[bool, str]:
-    """
-    Returns (ok, message).
-    Only enforced when open_mode is True.
-    """
+def make_join_link(value: str) -> str | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
+        return value
+    if value.startswith("@"):
+        return f"https://t.me/{value[1:]}"
+    if value.startswith("t.me/"):
+        return f"https://{value}"
+    return None
+
+
+async def check_force_join(bot, user_id: int) -> tuple[bool, str, InlineKeyboardMarkup | None]:
     if not is_open_mode():
-        return True, ""
+        return True, "", None
 
     missing = []
-    if FORCE_CHANNEL and not await is_member(bot, FORCE_CHANNEL, user_id):
-        missing.append(f"Channel: {FORCE_CHANNEL}")
-    if FORCE_GROUP and not await is_member(bot, FORCE_GROUP, user_id):
-        missing.append(f"Group: {FORCE_GROUP}")
+    buttons = []
+
+    if FORCE_CHANNEL:
+        is_in = await is_member(bot, FORCE_CHANNEL, user_id)
+        if not is_in:
+            missing.append("Channel")
+            link = make_join_link(FORCE_CHANNEL)
+            if link:
+                buttons.append(InlineKeyboardButton("📢 Join Channel", url=link))
+
+    if FORCE_GROUP:
+        is_in = await is_member(bot, FORCE_GROUP, user_id)
+        if not is_in:
+            missing.append("Group")
+            link = make_join_link(FORCE_GROUP)
+            if link:
+                buttons.append(InlineKeyboardButton("👥 Join Group", url=link))
 
     if not missing:
-        return True, ""
+        return True, "", None
 
-    lines = [
-        "🔒 You must join the required chats before using this bot:",
-        "",
-    ]
-    for m in missing:
-        lines.append(f"• {m}")
-    lines.append("")
-    lines.append("Join both, then send /start again.")
-    return False, "\n".join(lines)
+    text = (
+        "🔒 You must join the required chats before using this bot.\n\n"
+        "Tap the buttons below, join both, then send /start again."
+    )
+    markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    return False, text, markup
 
 
 def access_denied_text() -> str:
@@ -205,11 +234,6 @@ def access_denied_text() -> str:
 
 # ─── WORKER ───────────────────────────────────────────────────────────────────
 async def otp_worker(user_id: int, phone: str, chat_id: int, bot):
-    """
-    Keep requesting OTP every SEND_INTERVAL seconds.
-    - FloodWait ≥ MIN_LIMIT_HOURS → permanent stop for this job.
-    - Short FloodWait → sleep exact wait then resume.
-    """
     try:
         while True:
             client = TelegramClient(StringSession(), API_ID, API_HASH)
@@ -254,7 +278,6 @@ async def otp_worker(user_id: int, phone: str, chat_id: int, bot):
 
             await asyncio.sleep(SEND_INTERVAL)
     finally:
-        # Cleanup job entry
         if phone in active_jobs.get(user_id, {}):
             del active_jobs[user_id][phone]
             if not active_jobs[user_id]:
@@ -309,7 +332,6 @@ async def stop_jobs(user_id: int, phone: str | None = None) -> str:
             del active_jobs[user_id]
         return f"🛑 Stopped sending OTP on {phone}."
 
-    # stop all
     numbers = list(jobs.keys())
     count = len(numbers)
     for t in list(jobs.values()):
@@ -328,10 +350,6 @@ async def stop_jobs(user_id: int, phone: str | None = None) -> str:
 
 # ─── ACCESS GATE ──────────────────────────────────────────────────────────────
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Returns True if the user is allowed to proceed.
-    Handles owner, lock-mode access, and open-mode force-join.
-    """
     uid = update.effective_user.id
     add_known_user(uid)
 
@@ -339,13 +357,12 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return True
 
     if is_open_mode():
-        ok, msg = await check_force_join(context.bot, uid)
+        ok, msg, markup = await check_force_join(context.bot, uid)
         if not ok:
-            await update.message.reply_text(msg)
+            await update.message.reply_text(msg, reply_markup=markup)
             return False
         return True
 
-    # lock mode
     if not has_access(uid):
         await update.message.reply_text(access_denied_text())
         return False
@@ -409,7 +426,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def plain_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Private chat: user simply pastes a phone number."""
     if update.effective_chat.type != "private":
         return
     if not await gate(update, context):
@@ -417,7 +433,7 @@ async def plain_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (update.message.text or "").strip()
     if not is_valid_phone(text):
-        return  # ignore non-phone messages
+        return
 
     reply = await start_job(
         update.effective_user.id,
@@ -521,7 +537,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users = get_known_users()
-    # also include current access list
     for uid_str in get_access():
         users.add(int(uid_str))
     users.update(OWNER_IDS)
@@ -532,7 +547,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(uid, text)
             sent += 1
-            await asyncio.sleep(0.05)  # light flood protection
+            await asyncio.sleep(0.05)
         except Exception:
             failed += 1
 
